@@ -1,0 +1,25 @@
+{
+  "name": "symple-audio-splitter",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "シンプルな音声データ分割アプリ (PWA)",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "icons": "node scripts/gen-icons.mjs"
+  },
+  "dependencies": {
+    "@breezystack/lamejs": "^1.2.7",
+    "@ffmpeg/ffmpeg": "^0.12.15",
+    "@ffmpeg/util": "^0.12.2",
+    "fflate": "^0.8.3",
+    "mp4-muxer": "^5.2.2"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3",
+    "vite": "^7.3.8"
+  }
+}
