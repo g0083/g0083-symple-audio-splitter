@@ -839,7 +839,7 @@ applySilence.addEventListener('click', async () => {
 });
 
 overlapInput.addEventListener('input', () => {
-  overlapSec = Math.max(0, Number(overlapInput.value) || 0) / 1000;
+  overlapSec = Math.max(0, Number(overlapInput.value) || 0);
   refreshSegments();
 });
 
