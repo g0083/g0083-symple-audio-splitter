@@ -112,6 +112,13 @@ export class Waveform {
     this.schedule();
   }
 
+  /** 表示範囲を変えずにピークだけ差し替える (逐次解析用) */
+  updatePeaks(peaks: Peaks): void {
+    this.peaks = peaks;
+    this.bodyDirty = true;
+    this.schedule();
+  }
+
   setSplits(splits: number[]): void {
     this.splits = splits;
     if (this.drag && this.drag.kind === 'split') {

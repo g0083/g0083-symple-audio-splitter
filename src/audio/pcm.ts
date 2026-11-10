@@ -74,3 +74,20 @@ export function nearestMp3SampleRate(rate: number): number {
   }
   return best;
 }
+
+const MP3_BITRATES_MPEG1 = [32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320];
+const MP3_BITRATES_MPEG2 = [8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160];
+const MP3_BITRATES_MPEG25 = [8, 16, 24, 32, 40, 48, 56, 64];
+
+/**
+ * MP3 で実際に使えるビットレートに丸める。
+ * 元の品質を下回らないよう、指定値以上で最も近いもの選ぶ (上限はそのレートの最大値)。
+ */
+export function mp3BitrateFor(bitrate: number, sampleRate: number): number {
+  const ladder =
+    sampleRate >= 32000 ? MP3_BITRATES_MPEG1 : sampleRate >= 16000 ? MP3_BITRATES_MPEG2 : MP3_BITRATES_MPEG25;
+  for (const candidate of ladder) {
+    if (candidate >= bitrate) return candidate;
+  }
+  return ladder[ladder.length - 1];
+}

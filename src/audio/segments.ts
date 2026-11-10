@@ -51,6 +51,50 @@ export function equalSplits(duration: number, count: number): number[] {
 
 /**
  * 無音区間の中央を分割点として検出する。
+ * 10ms ごとの RMS を渡す方式にすることで、PCM の再走査を避ける。
+ */
+export function splitsFromRms(
+  rms: Float32Array,
+  hopSeconds: number,
+  duration: number,
+  options: SilenceOptions,
+): number[] {
+  if (rms.length < 2) return [];
+  const hopMs = hopSeconds * 1000;
+  const threshold = Math.pow(10, options.thresholdDb / 20);
+  const minSilenceFrames = Math.max(1, Math.round(options.minSilenceMs / hopMs));
+
+  const candidates: number[] = [];
+  let runStart = -1;
+  for (let f = 0; f <= rms.length; f++) {
+    const silent = f < rms.length && rms[f] < threshold;
+    if (silent && runStart < 0) runStart = f;
+    if (!silent && runStart >= 0) {
+      if (f - runStart >= minSilenceFrames) {
+        candidates.push(((runStart + f) / 2) * hopSeconds);
+      }
+      runStart = -1;
+    }
+  }
+
+  return filterSplits(candidates, duration, options.minSegmentMs);
+}
+
+function filterSplits(candidates: number[], duration: number, minSegmentMs: number): number[] {
+  const minSegment = Math.max(0.05, minSegmentMs / 1000);
+  const accepted: number[] = [];
+  let last = 0;
+  for (const point of candidates) {
+    if (point - last < minSegment) continue;
+    if (duration - point < minSegment) continue;
+    accepted.push(point);
+    last = point;
+  }
+  return normalizeSplits(accepted, duration);
+}
+
+/**
+ * 無音区間の中央を分割点として検出する。
  * 長い音源でもメインスレッドを塞がないよう、一定時間ごとにフレームを譲る。
  */
 export async function detectSilenceSplits(
@@ -90,30 +134,5 @@ export async function detectSilenceSplits(
     }
   }
 
-  const threshold = Math.pow(10, options.thresholdDb / 20);
-  const minSilenceFrames = Math.max(1, Math.round(options.minSilenceMs / 10));
-
-  const candidates: number[] = [];
-  let runStart = -1;
-  for (let f = 0; f <= frames; f++) {
-    const silent = f < frames && rms[f] < threshold;
-    if (silent && runStart < 0) runStart = f;
-    if (!silent && runStart >= 0) {
-      if (f - runStart >= minSilenceFrames) {
-        candidates.push((((runStart + f) / 2) * hop) / rate);
-      }
-      runStart = -1;
-    }
-  }
-
-  const minSegment = Math.max(0.05, options.minSegmentMs / 1000);
-  const accepted: number[] = [];
-  let last = 0;
-  for (const point of candidates) {
-    if (point - last < minSegment) continue;
-    if (duration - point < minSegment) continue;
-    accepted.push(point);
-    last = point;
-  }
-  return normalizeSplits(accepted, duration);
+  return splitsFromRms(rms, 0.01, duration, options);
 }

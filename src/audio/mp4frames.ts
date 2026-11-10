@@ -22,6 +22,11 @@ export type Mp4SampleIndex = {
   channels: number;
   /** AudioSpecificConfig (mp4-muxer に渡す decoderConfig.description) */
   audioSpecificConfig: Uint8Array;
+  /**
+   * 先頭で捨てるべきサンプル数 (AAC の priming)。
+   * elst の media_time から求める。デコーダ出力と再生位置を揃えるために使う。
+   */
+  priming: number;
 };
 
 /** デスクリプタの可変長サイズを読む */
@@ -78,8 +83,30 @@ function readAudioSpecificConfig(view: DataView, esdsStart: number, esdsEnd: num
   return null;
 }
 
-/** stts を展開して各サンプルの長さを埋める */
-function readStts(view: DataView, start: number, end: number, count: number, durations: Uint32Array): boolean {
+/**
+ * elst (edit list) の最初のエントリの media_time を読む。
+ * AAC ではここがエンコーダ遅延 (priming) のサンプル数を表す。
+ */
+function readElstMediaTime(view: DataView, trakStart: number, trakEnd: number): number {
+  const edts = findBox(view, trakStart, trakEnd, 'edts');
+  if (!edts) return 0;
+  const elst = findBox(view, edts.contentStart, edts.end, 'elst');
+  if (!elst) return 0;
+  const version = view.getUint8(elst.contentStart);
+  const entries = view.getUint32(elst.contentStart + 4);
+  if (entries === 0) return 0;
+  const base = elst.contentStart + 8;
+  if (version === 1) {
+    if (base + 20 > elst.end) return 0;
+    const mediaTime = view.getUint32(base + 8) * 4294967296 + view.getUint32(base + 12);
+    return mediaTime > 0 ? mediaTime : 0;
+  }
+  if (base + 12 > elst.end) return 0;
+  const mediaTime = view.getUint32(base + 4);
+  return mediaTime > 0 ? mediaTime : 0;
+}
+
+/** stts を展開して各サンプルの長さを埋める */function readStts(view: DataView, start: number, end: number, count: number, durations: Uint32Array): boolean {
   const entries = view.getUint32(start + 4);
   let pos = start + 8;
   let sample = 0;
@@ -181,6 +208,9 @@ export function indexMp4(bytes: Uint8Array): Mp4SampleIndex | null {
     const stbl = findBox(view, minf.contentStart, minf.end, 'stbl');
     if (!stbl) continue;
 
+    // AAC の priming (エンコーダ遅延)。elst が無い場合は 0
+    const priming = readElstMediaTime(view, trak.contentStart, trak.end);
+
     const stsd = findBox(view, stbl.contentStart, stbl.end, 'stsd');
     const stts = findBox(view, stbl.contentStart, stbl.end, 'stts');
     const stsz = findBox(view, stbl.contentStart, stbl.end, 'stsz');
@@ -246,9 +276,25 @@ export function indexMp4(bytes: Uint8Array): Mp4SampleIndex | null {
       sampleRate: sampleRate || 44100,
       channels: channels || 2,
       audioSpecificConfig: asc,
+      priming,
     };
   }
   return null;
+}
+
+/**
+ * 音声トラックの平均ビットレート (kbps)。
+ * サンプル長の合計から求めるため、コンテナのオーバーヘッドは含まない。
+ */
+export function mp4Bitrate(index: Mp4SampleIndex): number {
+  let bytes = 0;
+  let ticks = 0;
+  for (let i = 0; i < index.count; i++) {
+    bytes += index.sizes[i];
+    ticks += index.durations[i];
+  }
+  const seconds = ticks / index.timescale;
+  return seconds > 0 ? Math.round((bytes * 8) / 1000 / seconds) : 0;
 }
 
 /** 指定時刻に最も近いサンプル境界のインデックスを返す */

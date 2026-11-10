@@ -11,10 +11,11 @@
 import { decodeAudioFile } from '../src/audio/decode';
 import { computePeaks } from '../src/audio/peaks';
 import { buildSegments, equalSplits } from '../src/audio/segments';
-import { exportSegments } from '../src/audio/export';
+import { exportSegments, resolveOriginalBitrate } from '../src/audio/export';
 import { extOf } from '../src/audio/util';
 import { indexMp3 } from '../src/audio/mp3frames';
-import { indexMp4 } from '../src/audio/mp4frames';
+import { indexMp4, mp4Bitrate } from '../src/audio/mp4frames';
+import { readWavInfo } from '../src/audio/wav';
 
 import { isAacSupported } from '../src/audio/aac';
 import type { AudioSource, OutputFormat } from '../src/types';
@@ -145,24 +146,42 @@ async function run(): Promise<BenchResult> {
   const maxBlockMs = blockMonitor.stop();
 
   const ext = extOf(file.name);
+  const mp3Index = ext === 'mp3' ? indexMp3(bytes) : null;
+  const mp4Index = ext === 'm4a' || ext === 'mp4' || ext === 'm4b' || ext === 'aac' ? indexMp4(bytes) : null;
+  const wavInfo = ext === 'wav' ? readWavInfo(bytes) : null;
+  const bitrateKbps =
+    mp3Index?.averageBitrate ||
+    (mp4Index ? mp4Bitrate(mp4Index) : 0) ||
+    (decoded.duration > 0 ? Math.round((file.size * 8) / 1000 / decoded.duration) : 0);
   const source: AudioSource = {
     file,
     name: fixture.replace(/\.[^.]+$/, ''),
     ext,
     bytes,
-    buffer: decoded.buffer,
+    blob: file,
     sampleRate: decoded.sampleRate,
     channels: decoded.channels,
     duration: decoded.duration,
+    bitrate: bitrateKbps,
     peaks,
-    mp3Index: ext === 'mp3' ? indexMp3(bytes) : null,
-    mp4Index: ext === 'm4a' || ext === 'mp4' || ext === 'm4b' || ext === 'aac' ? indexMp4(bytes) : null,
+    mp3Index,
+    mp4Index,
+    wavInfo,
+    rms: null,
+    rmsHopSeconds: 0.01,
+    loadPcm: async () => decoded.buffer,
   };
 
   const splits = equalSplits(decoded.duration, splitCount + 1);
   const segments = buildSegments(splits, decoded.duration, 0);
 
-  const aacSupported = format === 'm4a' ? await isAacSupported(source.sampleRate, Math.min(2, source.channels), bitrate === 'original' ? 192 : bitrate) : false;
+  const aacSupported = format === 'm4a'
+    ? await isAacSupported(
+        source.sampleRate,
+        Math.min(2, source.channels),
+        typeof bitrate === 'number' ? bitrate : resolveOriginalBitrate(bitrateKbps, 'm4a'),
+      )
+    : false;
   const path =
     format === 'm4a'
       ? source.mp4Index !== null && bitrate === 'original'
@@ -174,7 +193,9 @@ async function run(): Promise<BenchResult> {
         ? source.ext === 'mp3' && source.mp3Index !== null && bitrate === 'original'
           ? 'mp3-frame-copy'
           : 'lamejs'
-        : 'wav';
+        : source.wavInfo !== null
+          ? 'wav-pcm-copy'
+          : 'wav-encode';
 
   const sampler = startHeapSampler();
   const t2 = performance.now();

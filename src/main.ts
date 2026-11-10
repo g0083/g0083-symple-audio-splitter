@@ -1,17 +1,18 @@
 import './style.css';
 import { zipSync } from 'fflate';
-import { decodeAudioFile } from './audio/decode';
-import { computePeaks } from './audio/peaks';
+import { inspectAudio, type AudioInfo } from './audio/inspect';
+import { decodeBytes } from './audio/decode';
+import { analyzeAsync, analyzeWithDecode, cancelAllAnalysis, computeRms, type AnalysisHandle } from './audio/analyze';
+import type { Peaks } from './audio/peaks';
+import type { WavBits } from './audio/wav';
 import {
   buildSegments,
-  detectSilenceSplits,
   equalSplits,
   normalizeSplits,
+  splitsFromRms,
   type Segment,
 } from './audio/segments';
-import { indexMp3 } from './audio/mp3frames';
-import { indexMp4 } from './audio/mp4frames';
-import { buildFileName, exportSegments, type ExportFile } from './audio/export';
+import { buildFileName, exportSegments, resolveEncodeBitrate, type ExportFile } from './audio/export';
 import { Waveform } from './ui/waveform';
 import { Player } from './ui/player';
 import { setupInstallButton } from './ui/install';
@@ -42,6 +43,8 @@ const zoomIn = el<HTMLButtonElement>('zoom-in');
 const zoomOut = el<HTMLButtonElement>('zoom-out');
 const zoomFit = el<HTMLButtonElement>('zoom-fit');
 const pan = el<HTMLInputElement>('pan');
+const waveStatus = el<HTMLElement>('wave-status');
+const waveStatusText = el<HTMLElement>('wave-status-text');
 
 const addSplitBtn = el<HTMLButtonElement>('add-split');
 const clearSplitsBtn = el<HTMLButtonElement>('clear-splits');
@@ -83,6 +86,7 @@ let cachedKey = '';
 let resultUrls: string[] = [];
 let seekTimer = 0;
 let renderScheduled = false;
+let currentAnalysis: AnalysisHandle | null = null;
 
 /* ------------------------------------------------------------------ toast */
 
@@ -150,46 +154,75 @@ async function loadFile(file: File): Promise<void> {
   if (exporting) return;
   setLoading('読み込み中…');
   try {
-    const { bytes, decoded } = await decodeAudioFile(file);
-    const peaks = await computePeaks(decoded.buffer);
+    const bytes = new Uint8Array(await file.arrayBuffer());
     const ext = extOf(file.name);
+    const info = inspectAudio(bytes, ext);
 
-    source = {
+    // 前のファイルの解析が残っていれば打ち切る (Worker の CPU を奪わない)
+    cancelAllAnalysis();
+    currentAnalysis = null;
+    waveform.setPeaks(null, 0);
+    setWaveProgress(null);
+
+    // コンテナ解析だけで UI を出せる場合は PCM デコードを待たない
+    const duration = info?.duration ?? 0;
+    const sampleRate = info?.sampleRate ?? 48000;
+    const channels = info?.channels ?? 2;
+
+    let pcmPromise: Promise<AudioBuffer> | null = null;
+    const loadPcm = (): Promise<AudioBuffer> => {
+      if (!pcmPromise) {
+        pcmPromise = decodePcm(bytes, ext).catch((error) => {
+          pcmPromise = null;
+          throw error;
+        });
+      }
+      return pcmPromise;
+    };
+
+    const sourceRef: AudioSource = {
       file,
       name: baseNameOf(file.name),
       ext,
       bytes,
-      buffer: decoded.buffer,
-      sampleRate: decoded.sampleRate,
-      channels: decoded.channels,
-      duration: decoded.duration,
-      peaks,
-      mp3Index: ext === 'mp3' ? indexMp3(bytes) : null,
-      mp4Index: ext === 'm4a' || ext === 'mp4' || ext === 'm4b' || ext === 'aac' ? indexMp4(bytes) : null,
+      blob: file,
+      sampleRate,
+      channels,
+      duration,
+      bitrate:
+        info?.bitrate ||
+        (duration > 0 ? Math.round((file.size * 8) / 1000 / duration) : 0),
+      peaks: null,
+      mp3Index: info?.mp3Index ?? null,
+      mp4Index: info?.mp4Index ?? null,
+      wavInfo: info?.wavInfo ?? null,
+      rms: null,
+      rmsHopSeconds: 0.01,
+      loadPcm,
     };
 
+    source = sourceRef;
     splits = [];
     playhead = 0;
     activeSegment = null;
     cachedFiles = null;
     cachedKey = '';
 
-    player.setBuffer(decoded.buffer);
-    waveform.setPeaks(peaks, decoded.duration);
+    player.setSource(file);
+    waveform.setPeaks(null, duration);
     waveform.setPlayhead(0);
     waveform.fit();
 
     fileName.textContent = file.name;
-    const channelLabel =
-      decoded.channels === 1 ? 'モノラル' : decoded.channels === 2 ? 'ステレオ' : `${decoded.channels}ch`;
+    const channelLabel = channels === 1 ? 'モノラル' : channels === 2 ? 'ステレオ' : `${channels}ch`;
     fileMeta.textContent = [
-      formatTime(decoded.duration, false),
-      `${(decoded.sampleRate / 1000).toFixed(1)} kHz`,
+      formatTime(duration, false),
+      `${(sampleRate / 1000).toFixed(1)} kHz`,
       channelLabel,
       formatBytes(file.size),
     ].join(' ・ ');
 
-    durTime.textContent = formatTime(decoded.duration);
+    durTime.textContent = formatTime(duration);
     curTime.textContent = formatTime(0);
 
     dropzone.hidden = true;
@@ -197,10 +230,12 @@ async function loadFile(file: File): Promise<void> {
     results.innerHTML = '';
     clearResultUrls();
     progress.hidden = true;
-
     updateQualityOptions();
     refreshSegments();
     hideToast();
+    setLoading(null);
+
+    void startAnalysis(sourceRef, info, bytes);
   } catch (error) {
     console.error(error);
     toast('このファイルを読み込めませんでした。mp3 / m4a をお試しください。');
@@ -209,9 +244,95 @@ async function loadFile(file: File): Promise<void> {
   }
 }
 
+/** PCM デコード (必要になったときだけ) */
+async function decodePcm(bytes: Uint8Array, ext: string): Promise<AudioBuffer> {
+  const { decoded } = await decodeBytes(bytes, ext);
+  return decoded.buffer;
+}
+
+/** 波形と RMS の解析。UI 表示後にバックグラウンドで進める */
+async function startAnalysis(sourceRef: AudioSource, info: AudioInfo | null, bytes: Uint8Array): Promise<void> {
+  const applyPeaks = (peaks: Peaks, progress?: { done: number; total: number }): void => {
+    if (source !== sourceRef) return;
+    const first = sourceRef.peaks === null;
+    sourceRef.peaks = peaks;
+    if (first) {
+      waveform.setPeaks(peaks, sourceRef.duration);
+      waveform.fit();
+    } else {
+      waveform.updatePeaks(peaks);
+    }
+    setWaveProgress(progress ? progress.done / Math.max(1, progress.total) : null);
+  };
+
+  const handle: AnalysisHandle | null = info
+    ? analyzeAsync(bytes, info, {
+        wantRms: true,
+        // 長い音源は間引いた粗い波形を先に出し、その後で精密化する
+        coarseStep: info.duration >= 600 ? 16 : info.duration >= 180 ? 4 : 1,
+        onPeaks: (peaks, progress) => applyPeaks(peaks, progress),
+      })
+    : null;
+
+  currentAnalysis = handle;
+  if (handle) setWaveProgress(0);
+
+  const finish = (peaks: Peaks, rms: Float32Array | null, hopSeconds: number): void => {
+    if (source !== sourceRef) return;
+    sourceRef.rms = rms;
+    sourceRef.rmsHopSeconds = hopSeconds;
+    if (sourceRef.peaks === null) {
+      waveform.setPeaks(peaks, sourceRef.duration);
+      waveform.fit();
+    }
+    setWaveProgress(null);
+  };
+
+  try {
+    if (handle) {
+      const result = await handle.done;
+      finish(result.peaks, result.rms, result.rmsHopSeconds);
+      return;
+    }
+
+    // フォールバック: PCM をデコードしてメインスレッドで計算
+    const buffer = await sourceRef.loadPcm();
+    const result = await analyzeWithDecode(buffer, (peaks, progress) => applyPeaks(peaks, progress));
+    if (source !== sourceRef) return;
+    const rms = computeRms(buffer);
+    finish(result.peaks, rms.rms, rms.hopSeconds);
+  } catch (error) {
+    if (error instanceof Error && error.message.includes('cancelled')) return;
+    console.warn('波形解析を Worker で行えませんでした', error);
+    try {
+      const buffer = await sourceRef.loadPcm();
+      const result = await analyzeWithDecode(buffer, (peaks, progress) => applyPeaks(peaks, progress));
+      if (source !== sourceRef) return;
+      const rms = computeRms(buffer);
+      finish(result.peaks, rms.rms, rms.hopSeconds);
+    } catch (fallbackError) {
+      console.error(fallbackError);
+      setWaveProgress(null);
+    }
+  } finally {
+    if (currentAnalysis === handle) currentAnalysis = null;
+  }
+}
+
 function clearResultUrls(): void {
   for (const url of resultUrls) URL.revokeObjectURL(url);
   resultUrls = [];
+}
+
+/** 波形解析の進捗表示。null で非表示 */
+function setWaveProgress(ratio: number | null): void {
+  if (ratio === null) {
+    waveStatus.hidden = true;
+    return;
+  }
+  waveStatus.hidden = false;
+  const percent = Math.round(ratio * 100);
+  waveStatusText.textContent = percent >= 100 ? '波形を解析中…' : `波形を解析中… ${percent}%`;
 }
 
 /* --------------------------------------------------------------- segments */
@@ -226,12 +347,25 @@ function outputFormat(): OutputFormat {
   return 'mp3';
 }
 
-function outputBitrate(format: OutputFormat): number | 'original' {
+function outputBitrate(): number | 'original' {
   const value = outQuality.value;
   if (value === 'original') return 'original';
-  if (value === 'none' || value === '') return format === 'm4a' ? 192 : 192;
+  if (value === 'none' || value === '') return 192;
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 192;
+}
+
+/** 再エンコード時に元の品質を維持できるビットレート (kbps) */
+function originalBitrateFor(format: OutputFormat): number {
+  return resolveEncodeBitrate(source?.bitrate ?? 0, format, source?.sampleRate ?? 44100);
+}
+
+/** WAV 出力のビット深度。'original' は元 WAV の PCM をそのままコピーする */
+function outputWavBits(): WavBits | 'original' {
+  const value = outQuality.value;
+  if (value === 'original') return 'original';
+  const parsed = Number(value);
+  return parsed === 16 || parsed === 32 ? parsed : 24;
 }
 
 function updateQualityOptions(): void {
@@ -240,23 +374,33 @@ function updateQualityOptions(): void {
   outQuality.innerHTML = '';
 
   if (format === 'wav') {
-    outQuality.add(new Option('PCM 16bit', 'none'));
-    outQuality.disabled = true;
+    outQuality.disabled = false;
+    const canCopy = source?.wavInfo != null;
+    if (canCopy) outQuality.add(new Option('元のまま (PCM コピー)', 'original'));
+    outQuality.add(new Option('24bit PCM', '24'));
+    outQuality.add(new Option('16bit PCM', '16'));
+    outQuality.add(new Option('32bit float', '32'));
+    const values = Array.from(outQuality.options).map((option) => option.value);
+    outQuality.value = values.includes(previous) ? previous : canCopy ? 'original' : '24';
     return;
   }
 
   outQuality.disabled = false;
   const canCopyFrames =
-    (format === 'mp3' && source?.ext === 'mp3' && source.mp3Index !== null) ||
+    (format === 'mp3' && source?.ext === 'mp3' && source.mp3Index != null) ||
     (format === 'm4a' && source?.mp4Index != null);
-  if (canCopyFrames) outQuality.add(new Option('元のまま (高速)', 'original'));
+  const originalLabel = canCopyFrames
+    ? '元のまま (高速)'
+    : source?.bitrate
+      ? `元のまま (${originalBitrateFor(format)} kbps)`
+      : '元のまま';
+  outQuality.add(new Option(originalLabel, 'original'));
 
   const rates = format === 'mp3' ? [128, 192, 256, 320] : [128, 192, 256];
   for (const rate of rates) outQuality.add(new Option(`${rate} kbps`, String(rate)));
 
   const values = Array.from(outQuality.options).map((option) => option.value);
-  if (values.includes(previous)) outQuality.value = previous;
-  else outQuality.value = canCopyFrames ? 'original' : '192';
+  outQuality.value = values.includes(previous) ? previous : 'original';
 }
 
 function refreshSegments(): void {
@@ -447,8 +591,9 @@ async function runExport(mode: 'files' | 'zip'): Promise<void> {
   if (!source || segments.length === 0 || exporting) return;
 
   const format = outputFormat();
-  const bitrate = outputBitrate(format);
-  const key = `${format}|${bitrate}|${overlapSec}|${splits.join(',')}`;
+  const bitrate = outputBitrate();
+  const wavBits = format === 'wav' ? outputWavBits() : undefined;
+  const key = `${format}|${bitrate}|${wavBits ?? ''}|${overlapSec}|${splits.join(',')}`;
 
   if (cachedFiles && cachedKey === key) {
     await deliver(cachedFiles, mode);
@@ -467,6 +612,7 @@ async function runExport(mode: 'files' | 'zip'): Promise<void> {
       segments,
       format,
       bitrate,
+      wavBits,
       onProgress: (done, total, label) => {
         setProgress(total > 0 ? done / total : 0, `${done} / ${total}  ${label}`);
       },
@@ -602,11 +748,25 @@ applySilence.addEventListener('click', async () => {
   applySilence.disabled = true;
   toast('無音区間を解析しています…', true);
   try {
-    splits = await detectSilenceSplits(source.buffer, {
+    const options = {
       thresholdDb: Number(silThreshold.value) || -40,
       minSilenceMs: Math.max(50, Number(silMin.value) || 300),
       minSegmentMs: Math.max(100, Number(silMinSeg.value) || 1000),
-    });
+    };
+
+    // 波形解析で作った 10ms RMS があれば PCM を再走査しない
+    let rms = source.rms;
+    let hopSeconds = source.rmsHopSeconds;
+    if (!rms) {
+      const buffer = await source.loadPcm();
+      const computed = computeRms(buffer);
+      rms = computed.rms;
+      hopSeconds = computed.hopSeconds;
+      source.rms = rms;
+      source.rmsHopSeconds = hopSeconds;
+    }
+
+    splits = splitsFromRms(rms, hopSeconds, source.duration, options);
     refreshSegments();
     toast(splits.length > 0 ? `${splits.length} 箇所で分割します` : '無音区間が見つかりませんでした');
   } catch (error) {

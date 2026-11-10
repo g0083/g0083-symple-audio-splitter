@@ -84,6 +84,10 @@
             </div>
             <div class="wave-wrap">
               <canvas id="wave" aria-label="波形"></canvas>
+              <div class="wave-status" id="wave-status" hidden>
+                <span class="wave-spinner" aria-hidden="true"></span>
+                <span id="wave-status-text">波形を解析中…</span>
+              </div>
             </div>
             <input type="range" id="pan" class="pan" min="0" max="1000" value="0" step="1" hidden aria-label="表示位置" />
             <p class="hint">

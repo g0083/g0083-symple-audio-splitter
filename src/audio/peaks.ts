@@ -26,12 +26,14 @@ export async function computePeaks(
   buffer: AudioBuffer,
   bucket = 256,
   onProgress?: (ratio: number) => void,
+  onPartial?: (peaks: Peaks) => void,
 ): Promise<Peaks> {
   const channels = channelsOf(buffer);
   const length = channels[0]?.length ?? 0;
   const count = Math.max(1, Math.ceil(length / bucket));
   const min = new Float32Array(count);
   const max = new Float32Array(count);
+  const peaks: Peaks = { min, max, bucket, sampleRate: buffer.sampleRate };
 
   const BUDGET_MS = 8;
   let sliceStart = performance.now();
@@ -53,10 +55,11 @@ export async function computePeaks(
 
     if (performance.now() - sliceStart >= BUDGET_MS) {
       onProgress?.((b + 1) / count);
+      onPartial?.(peaks);
       await new Promise((resolve) => setTimeout(resolve, 0));
       sliceStart = performance.now();
     }
   }
 
-  return { min, max, bucket, sampleRate: buffer.sampleRate };
+  return peaks;
 }

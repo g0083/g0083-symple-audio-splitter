@@ -1,5 +1,6 @@
 import { extOf } from './util';
 import { readBoxes } from './mp4boxes';
+import { readWavInfo } from './wav';
 
 export type DecodedAudio = {
   buffer: AudioBuffer;
@@ -67,6 +68,7 @@ export function probeSampleRate(bytes: Uint8Array, ext: string): number | null {
   try {
     if (ext === 'mp3') return probeMp3Rate(bytes);
     if (ext === 'm4a' || ext === 'mp4' || ext === 'm4b' || ext === 'aac') return probeMp4Rate(bytes);
+    if (ext === 'wav') return readWavInfo(bytes)?.sampleRate ?? null;
   } catch {
     /* 解析できなければ既定値を使う */
   }
@@ -74,12 +76,10 @@ export function probeSampleRate(bytes: Uint8Array, ext: string): number | null {
 }
 
 /**
- * 音声ファイルを PCM にデコードする。
+ * バイト列を PCM にデコードする。
  * 元のサンプルレートを維持するため、判明したレートで OfflineAudioContext を作る。
  */
-export async function decodeAudioFile(file: File): Promise<{ bytes: Uint8Array; decoded: DecodedAudio }> {
-  const bytes = new Uint8Array(await file.arrayBuffer());
-  const ext = extOf(file.name);
+export async function decodeBytes(bytes: Uint8Array, ext: string): Promise<{ bytes: Uint8Array; decoded: DecodedAudio }> {
   const probed = probeSampleRate(bytes, ext);
   const rate = probed && probed >= 8000 && probed <= 96000 ? probed : 48000;
 
@@ -97,4 +97,13 @@ export async function decodeAudioFile(file: File): Promise<{ bytes: Uint8Array; 
       duration: buffer.duration,
     },
   };
+}
+
+/**
+ * 音声ファイルを PCM にデコードする。
+ * 元のサンプルレートを維持するため、判明したレートで OfflineAudioContext を作る。
+ */
+export async function decodeAudioFile(file: File): Promise<{ bytes: Uint8Array; decoded: DecodedAudio }> {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  return decodeBytes(bytes, extOf(file.name));
 }
