@@ -1,4 +1,3 @@
-import type { Peaks } from './audio/peaks';
 import type { Mp3FrameIndex } from './audio/mp3frames';
 import type { Mp4SampleIndex } from './audio/mp4frames';
 import type { WavInfo } from './audio/wav';
@@ -16,7 +15,6 @@ export type AudioSource = {
   duration: number;
   /** 元ファイルの音声ビットレート (kbps)。不明なら 0 */
   bitrate: number;
-  peaks: Peaks | null;
   mp3Index: Mp3FrameIndex | null;
   /** m4a のサンプルインデックス (再エンコードせずに切り出すため) */
   mp4Index: Mp4SampleIndex | null;
@@ -25,6 +23,8 @@ export type AudioSource = {
   /** 無音検出用の 10ms RMS。解析前は null */
   rms: Float32Array | null;
   rmsHopSeconds: number;
+  /** 波形ピークを一度でも描画できたか (進捗表示の制御用) */
+  peaksReady: boolean;
   /** PCM がまだデコードされていない場合に取得する */
   loadPcm: () => Promise<AudioBuffer>;
 };

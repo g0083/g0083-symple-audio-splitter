@@ -1,214 +1,240 @@
 /**
- * 波形解析の進行管理。
- * Worker でピークと RMS を作り、逐次メインスレッドへ渡す。
- * Worker が使えない環境ではメインスレッドでチャンク実行する。
+ * 波形表示の進行管理。
+ *
+ * Worker を 2 つ使う:
+ * - rangeWorker: 表示範囲のピーク (操作に追従する必要がある)
+ * - rmsWorker: 全編の 10ms RMS (無音検出用のバックグラウンド処理)
+ *
+ * 同じ Worker に載せると、全編デコード中のズームが待たされてしまうため分ける。
+ * 解析対象は File として渡し、バイト列の読み込みも Worker 側で行う。
  */
 
 import PeaksWorker from '../workers/peaks.worker?worker';
-import type { AnalysisJob, AnalysisMessage, PeaksChunk } from './analysis';
-import { channelsOf, computePeaks, type Peaks } from './peaks';
+import type { AnalysisMessage, RangeJob, RmsJob, SourceSpec } from './analysis';
+import type { Peaks } from './peaks';
 import type { AudioInfo } from './inspect';
 
-export type AnalysisProgress = {
-  /** 解析済みのピーク数 */
-  done: number;
-  total: number;
+/** ピーク 1 個あたりのサンプル数 */
+export const PEAK_BUCKET = 256;
+
+type Pending = { resolve: (message: AnalysisMessage | null) => void };
+
+type Channel = {
+  worker: Worker | null;
+  pending: Map<number, Pending>;
+  sourceIds: Map<number, number>;
 };
 
-export type AnalysisHandle = {
-  /** ピークが増えるたびに呼ばれる。部分的な Peaks を渡す */
-  peaks: Peaks;
-  /** 解析完了まで待つ */
-  done: Promise<{ peaks: Peaks; rms: Float32Array | null; rmsHopSeconds: number }>;
-  cancel(): void;
-};
-
-const SAMPLE_BUCKET = 256;
-
-let worker: Worker | null = null;
 let sequence = 0;
-const active = new Map<number, (message: AnalysisMessage) => void>();
 
-function getWorker(): Worker | null {
+function createChannel(): Channel {
+  return { worker: null, pending: new Map(), sourceIds: new Map() };
+}
+
+const rangeChannel = createChannel();
+const rmsChannel = createChannel();
+
+function getWorker(channel: Channel): Worker | null {
   if (typeof Worker === 'undefined') return null;
-  if (worker) return worker;
+  if (channel.worker) return channel.worker;
   try {
     const instance = new PeaksWorker();
     instance.onmessage = (event: MessageEvent) => {
       const message = event.data as AnalysisMessage;
-      const handler = active.get(message.id);
-      if (handler) handler(message);
+      const request = channel.pending.get(message.id);
+      if (request) request.resolve(message);
     };
     instance.onerror = () => {
-      for (const handler of active.values()) {
-        handler({ id: -1, type: 'error', message: 'worker error' });
-      }
-      active.clear();
-      worker = null;
+      for (const request of channel.pending.values()) request.resolve(null);
+      channel.pending.clear();
+      channel.worker = null;
     };
-    worker = instance;
+    channel.worker = instance;
     return instance;
   } catch {
     return null;
   }
 }
 
-/**
- * Worker に解析を依頼する。解析結果は onPeaks で逐次届く。
- * Worker が使えない、またはコーデック非対応の場合は fallback を呼ぶ。
- */
-export function analyzeAsync(
-  bytes: Uint8Array,
-  info: AudioInfo,
-  options: {
-    wantRms: boolean;
-    /** 粗い波形を先に描くための間引き間隔。1 で無効 */
-    coarseStep?: number;
-    onPeaks: (peaks: Peaks, progress: AnalysisProgress) => void;
-  },
-): AnalysisHandle | null {
-  const instance = getWorker();
-  if (!instance) return null;
-
-  const id = ++sequence;
-  const total = Math.max(1, Math.ceil((info.duration * info.sampleRate) / SAMPLE_BUCKET) + 1);
-  const min = new Float32Array(total);
-  const max = new Float32Array(total);
-  const peaks: Peaks = { min, max, bucket: SAMPLE_BUCKET, sampleRate: info.sampleRate };
-  let filled = 0;
-  let rms: Float32Array | null = null;
-  let rmsHopSeconds = 0.01;
-  let settled = false;
-  let resolveDone: (value: { peaks: Peaks; rms: Float32Array | null; rmsHopSeconds: number }) => void = () => {};
-  let rejectDone: (error: Error) => void = () => {};
-
-  const done = new Promise<{ peaks: Peaks; rms: Float32Array | null; rmsHopSeconds: number }>(
-    (resolve, reject) => {
-      resolveDone = resolve;
-      rejectDone = reject;
-    },
-  );
-
-  const finish = (): void => {
-    if (settled) return;
-    settled = true;
-    active.delete(id);
-    resolveDone({ peaks, rms, rmsHopSeconds });
-  };
-
-  const cleanup = (): void => {
-    active.delete(id);
-  };
-
-  active.set(id, (message) => {
-    if (message.type === 'peaks') {
-      const chunk = message as PeaksChunk;
-      if (chunk.start < total) {
-        min.set(chunk.min, chunk.start);
-        max.set(chunk.max, chunk.start);
-        filled = Math.max(filled, Math.min(total, chunk.start + chunk.min.length));
-      }
-      options.onPeaks(peaks, { done: filled, total });
-      return;
-    }
-    if (message.type === 'rms') {
-      rms = message.rms;
-      rmsHopSeconds = message.hopSeconds;
-      return;
-    }
-    if (message.type === 'done') {
-      filled = Math.max(filled, Math.min(total, message.peakCount));
-      options.onPeaks(peaks, { done: filled, total });
-      finish();
-      return;
-    }
-    if (message.type === 'unsupported') {
-      settled = true;
-      cleanup();
-      rejectDone(new Error(`unsupported: ${message.reason}`));
-      return;
-    }
-    if (message.type === 'error') {
-      settled = true;
-      cleanup();
-      rejectDone(new Error(message.message));
-    }
-  });
-
-  const job: AnalysisJob = {
-    id,
-    bytes,
+function specOf(file: File, info: AudioInfo): SourceSpec {
+  return {
+    file,
     sampleRate: info.sampleRate,
     channels: info.channels,
     duration: info.duration,
-    bucket: SAMPLE_BUCKET,
-    wantRms: options.wantRms,
     codec: info.codec,
     mp3: info.mp3Index,
     mp4: info.mp4Index,
     wav: info.wavInfo,
     asc: info.audioSpecificConfig,
-    coarseStep: Math.max(1, Math.floor(options.coarseStep ?? 1)),
-  };
-
-  try {
-    // 元ファイルのバイト列は再エンコードでも使うため transfer せずコピーする
-    instance.postMessage(job);
-  } catch (error) {
-    cleanup();
-    return null;
-  }
-
-  return {
-    peaks,
-    done,
-    cancel(): void {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      resolveDone({ peaks, rms, rmsHopSeconds });
-    },
   };
 }
 
 /**
- * 進行中の解析をすべて打ち切る。
- * Worker は処理中のジョブを中断できないため、終了して作り直す。
+ * 解析対象を波形用 Worker に登録する。
+ * File を渡すだけで即座に戻り、実際の読み込みは Worker 側で行う。
  */
-export function cancelAllAnalysis(): void {
-  if (active.size === 0 && !worker) return;
-  for (const handler of Array.from(active.values())) {
-    handler({ id: -1, type: 'error', message: 'cancelled' });
-  }
-  active.clear();
-  if (worker) {
-    worker.terminate();
-    worker = null;
-  }
-}
-
-/** Worker フォールバック: decodeAudioData + メインスレッドピーク計算 */
-export async function analyzeWithDecode(
-  buffer: AudioBuffer,
-  onPeaks?: (peaks: Peaks, progress: AnalysisProgress) => void,
-): Promise<{ peaks: Peaks; rms: Float32Array | null; rmsHopSeconds: number }> {
-  let latest: Peaks | null = null;
-  let total = 0;
-  const peaks = await computePeaks(buffer, SAMPLE_BUCKET, (ratio) => {
-    if (!latest) return;
-    onPeaks?.(latest, { done: Math.round(ratio * total), total });
-  }, (partial) => {
-    latest = partial;
-    total = partial.min.length;
-    onPeaks?.(partial, { done: 0, total });
+export function registerSource(file: File, info: AudioInfo): { sourceId: number; ready: Promise<void> } | null {
+  const range = getWorker(rangeChannel);
+  if (!range) return null;
+  const sourceId = ++sequence;
+  const jobId = ++sequence;
+  rangeChannel.sourceIds.set(sourceId, sourceId);
+  const ready = new Promise<void>((resolve) => {
+    rangeChannel.pending.set(jobId, { resolve: () => resolve() });
+    try {
+      range.postMessage({ id: jobId, type: 'source', sourceId, spec: specOf(file, info) });
+    } catch {
+      rangeChannel.pending.delete(jobId);
+      resolve();
+    }
   });
-  onPeaks?.(peaks, { done: peaks.min.length, total: peaks.min.length });
-  return { peaks, rms: null, rmsHopSeconds: 0.01 };
+  return { sourceId, ready };
 }
 
-/** PCM から 10ms RMS を作る (無音検出用) */
+/** 登録した解析対象を破棄する */
+export function releaseSource(sourceId: number): void {
+  for (const channel of [rangeChannel, rmsChannel]) {
+    if (!channel.worker) continue;
+    channel.worker.postMessage({ id: ++sequence, type: 'release', sourceId });
+    channel.sourceIds.delete(sourceId);
+  }
+}
+
+export function canAnalyze(): boolean {
+  return getWorker(rangeChannel) !== null;
+}
+
+/**
+ * 指定したサンプル範囲のピークを要求する。
+ * onPartial には届いたぶんから順に、同じ Peaks オブジェクトを渡す。
+ */
+export function requestRange(
+  sourceId: number,
+  sampleRate: number,
+  startSample: number,
+  endSample: number,
+  bucket: number,
+  onPartial?: (peaks: Peaks) => void,
+): Promise<Peaks | null> {
+  const instance = getWorker(rangeChannel);
+  if (!instance) return Promise.resolve(null);
+
+  const step = Math.max(256, Math.floor(bucket / 256) * 256);
+  const id = ++sequence;
+  const base = Math.max(0, Math.floor(startSample / step) * step);
+  const end = Math.max(base + step, Math.ceil(endSample / step) * step);
+  const job: RangeJob = { id, type: 'range', sourceId, bucket: step, startSample: base, endSample: end };
+
+  const count = Math.max(1, Math.ceil((end - base) / step));
+  const min = new Float32Array(count);
+  const max = new Float32Array(count);
+  const peaks: Peaks = { min, max, bucket: step, startSample: base, valid: 0, sampleRate };
+
+  return new Promise<Peaks | null>((resolve) => {
+    rangeChannel.pending.set(id, {
+      resolve: (message) => {
+        if (!message) {
+          rangeChannel.pending.delete(id);
+          resolve(peaks.valid > 0 ? peaks : null);
+          return;
+        }
+        if (message.type === 'range-partial') {
+          const to = Math.min(count, message.offset + message.min.length);
+          min.set(message.min, message.offset);
+          max.set(message.max, message.offset);
+          peaks.valid = Math.max(peaks.valid, to);
+          onPartial?.(peaks);
+          return;
+        }
+        if (message.type === 'range') {
+          rangeChannel.pending.delete(id);
+          const to = Math.min(count, message.min.length);
+          min.set(message.min, 0);
+          max.set(message.max, 0);
+          peaks.valid = to;
+          onPartial?.(peaks);
+          resolve(peaks);
+          return;
+        }
+        if (message.type === 'done') return;
+        rangeChannel.pending.delete(id);
+        resolve(peaks.valid > 0 ? peaks : null);
+      },
+    });
+    try {
+      instance.postMessage(job);
+    } catch {
+      rangeChannel.pending.delete(id);
+      resolve(null);
+    }
+  });
+}
+
+/**
+ * 全編の RMS をバックグラウンドで作る。
+ * 41MB のバイト列を複製しないよう、File をそのまま渡して Worker 側で読ませる。
+ * 分割や書き出しが始まったら cancel() で止める。
+ */
+export function requestRms(
+  file: File,
+  info: AudioInfo,
+  sourceId: number,
+  hopSeconds = 0.01,
+): { result: Promise<Float32Array | null>; cancel(): void } {
+  const instance = getWorker(rmsChannel);
+  if (!instance) return { result: Promise.resolve(null), cancel: () => {} };
+
+  const id = ++sequence;
+  // RMS Worker は自分でファイルを読む
+  instance.postMessage({ id: ++sequence, type: 'source', sourceId, spec: specOf(file, info) });
+  const job: RmsJob = { id, type: 'rms', sourceId, hopSeconds };
+
+  const result = new Promise<Float32Array | null>((resolve) => {
+    rmsChannel.pending.set(id, {
+      resolve: (message) => {
+        if (!message) {
+          rmsChannel.pending.delete(id);
+          resolve(null);
+          return;
+        }
+        if (message.type === 'rms') {
+          rmsChannel.pending.delete(id);
+          resolve(message.rms);
+          return;
+        }
+        if (message.type === 'done') return;
+        rmsChannel.pending.delete(id);
+        resolve(null);
+      },
+    });
+    try {
+      instance.postMessage(job);
+    } catch {
+      rmsChannel.pending.delete(id);
+      resolve(null);
+    }
+  });
+
+  return {
+    result,
+    cancel(): void {
+      if (!rmsChannel.pending.has(id)) return;
+      rmsChannel.pending.delete(id);
+      // Worker は処理を中断できないため、終了して作り直す
+      rmsChannel.worker?.terminate();
+      rmsChannel.worker = null;
+      rmsChannel.sourceIds.clear();
+      for (const request of rmsChannel.pending.values()) request.resolve(null);
+      rmsChannel.pending.clear();
+    },
+  };
+}
+
+/** PCM から 10ms RMS を作る (Worker が使えないときのフォールバック) */
 export function computeRms(buffer: AudioBuffer): { rms: Float32Array; hopSeconds: number } {
-  const channels = channelsOf(buffer);
+  const channels: Float32Array[] = [];
+  for (let c = 0; c < buffer.numberOfChannels; c++) channels.push(buffer.getChannelData(c));
   const hop = Math.max(1, Math.round(buffer.sampleRate * 0.01));
   const length = channels[0]?.length ?? 0;
   const frames = Math.floor(length / hop);

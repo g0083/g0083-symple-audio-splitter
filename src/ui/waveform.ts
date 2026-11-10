@@ -7,6 +7,8 @@ export type WaveformHandlers = {
   onMoveSplit: (index: number, time: number) => void;
   onDeleteSplit: (index: number) => void;
   onViewChange: (start: number, end: number) => void;
+  /** 表示範囲のピークが必要になった。範囲は秒 */
+  onRangeChange: (start: number, end: number) => void;
 };
 
 const RULER_HEIGHT = 18;
@@ -110,13 +112,46 @@ export class Waveform {
     this.viewEnd = Math.max(duration, MIN_SPAN);
     this.bodyDirty = true;
     this.schedule();
+    this.requestRange();
   }
 
-  /** 表示範囲を変えずにピークだけ差し替える (逐次解析用) */
+  /** 表示範囲を変えずにピークだけ差し替える */
   updatePeaks(peaks: Peaks): void {
     this.peaks = peaks;
     this.bodyDirty = true;
     this.schedule();
+  }
+
+  /** 表示範囲のピークを要求する (描画や操作の直前に呼ばれる) */
+  private requestRange(): void {
+    if (this.duration <= 0) return;
+    // 画面幅の 2 倍ぶんを余裕として持っておく (横スクロールを滑らかにする)
+    const span = this.viewEnd - this.viewStart;
+    const margin = span * 0.5;
+    this.handlers.onRangeChange(
+      Math.max(0, this.viewStart - margin),
+      Math.min(this.duration, this.viewEnd + margin),
+    );
+  }
+
+  /** ピークが揃っているか (要求済み範囲の描画判定用) */
+  private hasPeaksForView(): boolean {
+    return this.peaks !== null && this.peaks.valid > 0;
+  }
+
+  /** ピーク未取得のときに「解析中」を出しているか */
+  get loading(): boolean {
+    return !this.hasPeaksForView();
+  }
+
+  /** 1 ピクセルあたりのサンプル数から、適切なピーク間隔を求める */
+  bucketFor(sampleRate: number): number {
+    const span = this.viewEnd - this.viewStart;
+    const perPixel = (span * sampleRate) / Math.max(1, this.width);
+    // 1px あたり 1 ピーク以上になるよう 2 の冪に丸める (上限 65536)
+    let bucket = 256;
+    while (bucket < perPixel && bucket < 65536) bucket *= 2;
+    return bucket;
   }
 
   setSplits(splits: number[]): void {
@@ -153,6 +188,7 @@ export class Waveform {
     this.bodyDirty = true;
     this.schedule();
     this.handlers.onViewChange(this.viewStart, this.viewEnd);
+    this.requestRange();
   }
 
   zoom(factor: number, anchorTime?: number): void {
@@ -238,21 +274,26 @@ export class Waveform {
     ctx.stroke();
 
     const peaks = this.peaks;
-    if (!peaks || peaks.min.length === 0) return;
+    if (!peaks || peaks.valid === 0) return;
 
     const span = this.viewEnd - this.viewStart;
     const samplesPerPixel = (span * peaks.sampleRate) / width;
     const baseSample = this.viewStart * peaks.sampleRate;
+    // ピーク配列は startSample から始まる部分配列なので、その分を引いて参照する
+    const offset = peaks.startSample;
     ctx.fillStyle = colors.wave;
 
     for (let x = 0; x < width; x++) {
-      const b0 = Math.floor((baseSample + x * samplesPerPixel) / peaks.bucket);
-      const b1 = Math.max(b0 + 1, Math.ceil((baseSample + (x + 1) * samplesPerPixel) / peaks.bucket));
+      const b0 = Math.floor((baseSample + x * samplesPerPixel - offset) / peaks.bucket);
+      const b1 = Math.max(
+        b0 + 1,
+        Math.ceil((baseSample + (x + 1) * samplesPerPixel - offset) / peaks.bucket),
+      );
       const count = b1 - b0;
       const stride = count > 64 ? Math.floor(count / 64) : 1;
       let lo = 0;
       let hi = 0;
-      for (let b = Math.max(0, b0); b < b1 && b < peaks.min.length; b += stride) {
+      for (let b = Math.max(0, b0); b < b1 && b < peaks.valid; b += stride) {
         if (peaks.min[b] < lo) lo = peaks.min[b];
         if (peaks.max[b] > hi) hi = peaks.max[b];
       }

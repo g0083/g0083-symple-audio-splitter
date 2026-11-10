@@ -163,12 +163,12 @@ async function run(): Promise<BenchResult> {
     channels: decoded.channels,
     duration: decoded.duration,
     bitrate: bitrateKbps,
-    peaks,
     mp3Index,
     mp4Index,
     wavInfo,
     rms: null,
     rmsHopSeconds: 0.01,
+    peaksReady: true,
     loadPcm: async () => decoded.buffer,
   };
 

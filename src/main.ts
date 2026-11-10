@@ -2,8 +2,15 @@ import './style.css';
 import { zipSync } from 'fflate';
 import { inspectAudio, type AudioInfo } from './audio/inspect';
 import { decodeBytes } from './audio/decode';
-import { analyzeAsync, analyzeWithDecode, cancelAllAnalysis, computeRms, type AnalysisHandle } from './audio/analyze';
-import type { Peaks } from './audio/peaks';
+import {
+  canAnalyze,
+  computeRms,
+  registerSource,
+  releaseSource,
+  requestRange,
+  requestRms,
+} from './audio/analyze';
+import { computePeaks, type Peaks } from './audio/peaks';
 import type { WavBits } from './audio/wav';
 import {
   buildSegments,
@@ -86,7 +93,11 @@ let cachedKey = '';
 let resultUrls: string[] = [];
 let seekTimer = 0;
 let renderScheduled = false;
-let currentAnalysis: AnalysisHandle | null = null;
+let analysisSourceId: number | null = null;
+let rmsTask: { cancel(): void } | null = null;
+let loadedRange: { start: number; end: number; bucket: number } | null = null;
+let rangeRequest = 0;
+let fallbackPeaks: Peaks | null = null;
 
 /* ------------------------------------------------------------------ toast */
 
@@ -120,6 +131,9 @@ const waveform = new Waveform(el<HTMLCanvasElement>('wave'), {
     const maxStart = Math.max(0, (source?.duration ?? 0) - span);
     pan.hidden = maxStart <= 0.001;
     pan.value = maxStart > 0 ? String(Math.round((start / maxStart) * 1000)) : '0';
+  },
+  onRangeChange: (start, end) => {
+    void loadRange(start, end);
   },
 });
 
@@ -159,8 +173,7 @@ async function loadFile(file: File): Promise<void> {
     const info = inspectAudio(bytes, ext);
 
     // 前のファイルの解析が残っていれば打ち切る (Worker の CPU を奪わない)
-    cancelAllAnalysis();
-    currentAnalysis = null;
+    cancelBackgroundWork();
     waveform.setPeaks(null, 0);
     setWaveProgress(null);
 
@@ -192,16 +205,27 @@ async function loadFile(file: File): Promise<void> {
       bitrate:
         info?.bitrate ||
         (duration > 0 ? Math.round((file.size * 8) / 1000 / duration) : 0),
-      peaks: null,
       mp3Index: info?.mp3Index ?? null,
       mp4Index: info?.mp4Index ?? null,
       wavInfo: info?.wavInfo ?? null,
       rms: null,
       rmsHopSeconds: 0.01,
+      peaksReady: false,
       loadPcm,
     };
 
     source = sourceRef;
+    if (analysisSourceId !== null) {
+      releaseSource(analysisSourceId);
+      analysisSourceId = null;
+    }
+    if (info) {
+      const registered = registerSource(file, info);
+      analysisSourceId = registered?.sourceId ?? null;
+    }
+    loadedRange = null;
+    fallbackPeaks = null;
+    rangeRequest = 0;
     splits = [];
     playhead = 0;
     activeSegment = null;
@@ -235,7 +259,8 @@ async function loadFile(file: File): Promise<void> {
     hideToast();
     setLoading(null);
 
-    void startAnalysis(sourceRef, info, bytes);
+    // 表示範囲の波形は waveform 側から要求される。RMS は全編が必要なので裏で進める
+    if (info) startBackgroundRms(sourceRef, info);
   } catch (error) {
     console.error(error);
     toast('このファイルを読み込めませんでした。mp3 / m4a をお試しください。');
@@ -250,73 +275,106 @@ async function decodePcm(bytes: Uint8Array, ext: string): Promise<AudioBuffer> {
   return decoded.buffer;
 }
 
-/** 波形と RMS の解析。UI 表示後にバックグラウンドで進める */
-async function startAnalysis(sourceRef: AudioSource, info: AudioInfo | null, bytes: Uint8Array): Promise<void> {
-  const applyPeaks = (peaks: Peaks, progress?: { done: number; total: number }): void => {
-    if (source !== sourceRef) return;
-    const first = sourceRef.peaks === null;
-    sourceRef.peaks = peaks;
-    if (first) {
-      waveform.setPeaks(peaks, sourceRef.duration);
-      waveform.fit();
-    } else {
+/**
+ * 表示範囲の波形を読み込む。
+ * 表示範囲が変わるたびに呼ばれ、前の要求は破棄して最新だけ反映する。
+ */
+async function loadRange(startSec: number, endSec: number): Promise<void> {
+  const src = source;
+  const sourceId = analysisSourceId;
+  if (!src) return;
+
+  // 表示解像度に合わせてピーク間隔を決める (全体表示では大きく間引く)
+  const bucket = waveform.bucketFor(src.sampleRate);
+
+  // 同じ範囲を同じ解像度で要求済みなら何もしない
+  if (
+    loadedRange &&
+    startSec >= loadedRange.start &&
+    endSec <= loadedRange.end &&
+    loadedRange.bucket <= bucket
+  ) {
+    return;
+  }
+
+  const startSample = Math.max(0, Math.floor(startSec * src.sampleRate));
+  const endSample = Math.max(startSample + 1, Math.ceil(endSec * src.sampleRate));
+  const request = ++rangeRequest;
+  if (!src.peaksReady) setWaveProgress(0);
+
+  if (sourceId !== null) {
+    const peaks = await requestRange(sourceId, src.sampleRate, startSample, endSample, bucket, (partial) => {
+      if (request !== rangeRequest || source !== src) return;
+      src.peaksReady = true;
+      waveform.updatePeaks(partial);
+      setWaveProgress(null);
+    });
+    if (request !== rangeRequest || source !== src) return;
+    if (peaks) {
+      loadedRange = { start: startSec, end: endSec, bucket: peaks.bucket };
+      src.peaksReady = true;
       waveform.updatePeaks(peaks);
-    }
-    setWaveProgress(progress ? progress.done / Math.max(1, progress.total) : null);
-  };
-
-  const handle: AnalysisHandle | null = info
-    ? analyzeAsync(bytes, info, {
-        wantRms: true,
-        // 長い音源は間引いた粗い波形を先に出し、その後で精密化する
-        coarseStep: info.duration >= 600 ? 16 : info.duration >= 180 ? 4 : 1,
-        onPeaks: (peaks, progress) => applyPeaks(peaks, progress),
-      })
-    : null;
-
-  currentAnalysis = handle;
-  if (handle) setWaveProgress(0);
-
-  const finish = (peaks: Peaks, rms: Float32Array | null, hopSeconds: number): void => {
-    if (source !== sourceRef) return;
-    sourceRef.rms = rms;
-    sourceRef.rmsHopSeconds = hopSeconds;
-    if (sourceRef.peaks === null) {
-      waveform.setPeaks(peaks, sourceRef.duration);
-      waveform.fit();
-    }
-    setWaveProgress(null);
-  };
-
-  try {
-    if (handle) {
-      const result = await handle.done;
-      finish(result.peaks, result.rms, result.rmsHopSeconds);
+      setWaveProgress(null);
       return;
     }
-
-    // フォールバック: PCM をデコードしてメインスレッドで計算
-    const buffer = await sourceRef.loadPcm();
-    const result = await analyzeWithDecode(buffer, (peaks, progress) => applyPeaks(peaks, progress));
-    if (source !== sourceRef) return;
-    const rms = computeRms(buffer);
-    finish(result.peaks, rms.rms, rms.hopSeconds);
-  } catch (error) {
-    if (error instanceof Error && error.message.includes('cancelled')) return;
-    console.warn('波形解析を Worker で行えませんでした', error);
-    try {
-      const buffer = await sourceRef.loadPcm();
-      const result = await analyzeWithDecode(buffer, (peaks, progress) => applyPeaks(peaks, progress));
-      if (source !== sourceRef) return;
-      const rms = computeRms(buffer);
-      finish(result.peaks, rms.rms, rms.hopSeconds);
-    } catch (fallbackError) {
-      console.error(fallbackError);
-      setWaveProgress(null);
-    }
-  } finally {
-    if (currentAnalysis === handle) currentAnalysis = null;
+    // Worker が使えない/非対応コーデック: PCM デコードにフォールバック
   }
+
+  await loadRangeWithDecode(startSec, endSec, request);
+}
+
+/** Worker が使えないときのフォールバック。全体を一度だけデコードしてピークを作る */
+async function loadRangeWithDecode(startSec: number, endSec: number, request: number): Promise<void> {
+  const src = source;
+  if (!src) return;
+  try {
+    if (!fallbackPeaks) {
+      setWaveProgress(0);
+      const buffer = await src.loadPcm();
+      if (source !== src) return;
+      fallbackPeaks = await computePeaks(buffer);
+      if (source !== src) return;
+      if (!src.rms) {
+        const rms = computeRms(buffer);
+        src.rms = rms.rms;
+        src.rmsHopSeconds = rms.hopSeconds;
+      }
+    }
+    if (request !== rangeRequest || source !== src) return;
+    loadedRange = { start: 0, end: src.duration, bucket: fallbackPeaks.bucket };
+    src.peaksReady = true;
+    waveform.updatePeaks(fallbackPeaks);
+    setWaveProgress(null);
+    void startSec;
+    void endSec;
+  } catch (error) {
+    console.warn('波形を作成できませんでした', error);
+    setWaveProgress(null);
+  }
+}
+
+/** 無音検出用の RMS をバックグラウンドで作る */
+function startBackgroundRms(src: AudioSource, info: AudioInfo): void {
+  const sourceId = analysisSourceId;
+  if (sourceId === null || !canAnalyze()) return;
+
+  const task = requestRms(src.file, info, sourceId, 0.01);
+  rmsTask = task;
+  void task.result.then((rms) => {
+    if (rmsTask === task) rmsTask = null;
+    if (source !== src || !rms) return;
+    src.rms = rms;
+    src.rmsHopSeconds = 0.01;
+  });
+}
+
+/** バックグラウンド処理 (RMS) を打ち切る */
+function cancelBackgroundWork(): void {
+  rmsTask?.cancel();
+  rmsTask = null;
+  loadedRange = null;
+  fallbackPeaks = null;
+  rangeRequest++;
 }
 
 function clearResultUrls(): void {
@@ -602,6 +660,9 @@ async function runExport(mode: 'files' | 'zip'): Promise<void> {
 
   exporting = true;
   cancelRequested = false;
+  // 分割中はバックグラウンドの RMS 作成を止めて、CPU を書き出しに回す
+  rmsTask?.cancel();
+  rmsTask = null;
   updateExportState();
   progress.hidden = false;
   setProgress(0, '準備しています…');
@@ -830,3 +891,4 @@ if ('serviceWorker' in navigator && import.meta.env.PROD) {
 
 updateQualityOptions();
 updateExportState();
+
