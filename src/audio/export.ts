@@ -2,9 +2,10 @@ import type { AudioSource, OutputFormat } from '../types';
 import type { Segment } from './segments';
 import { encodeWav } from './wav';
 import { encodeMp3 } from './mp3';
-import { encodeAac, isAacSupported } from './aac';
+import { createAacEncoderSession, isAacSupported, type AacEncoderSession } from './aac';
 import { encodeAacWithFFmpeg } from './ffmpeg';
 import { sliceMp3 } from './mp3frames';
+import { copyM4aSegment } from './m4acopy';
 import { nearestMp3SampleRate, resampleChannels, sliceChannels } from './pcm';
 import { blobPart, nextFrame } from './util';
 
@@ -41,15 +42,35 @@ export async function exportSegments(options: ExportOptions): Promise<ExportFile
   const canCopyMp3Frames =
     format === 'mp3' && source.ext === 'mp3' && source.mp3Index !== null && options.bitrate === 'original';
 
+  const canCopyM4aSamples =
+    format === 'm4a' && source.mp4Index !== null && options.bitrate === 'original';
+
   const bitrate = resolveBitrate(options.bitrate);
   const aacViaWebCodecs =
-    format === 'm4a' ? await isAacSupported(source.sampleRate, Math.min(2, source.channels), bitrate) : false;
+    format === 'm4a' && !canCopyM4aSamples
+      ? await isAacSupported(source.sampleRate, Math.min(2, source.channels), bitrate)
+      : false;
 
-  if (format === 'm4a' && !aacViaWebCodecs) {
+  if (format === 'm4a' && !aacViaWebCodecs && !canCopyM4aSamples) {
     onStatus?.('AAC エンコーダを読み込んでいます（初回のみ・数十MB）…');
   }
 
-  for (const segment of segments) {
+  // セグメントごとに AudioEncoder を作り直すと初期化コストが積み上がるため、
+  // 同じ設定で書き出す間は 1 つのセッションを使い回す。
+  const sessionRef: { current: AacEncoderSession | null } = { current: null };
+  const getAacSession = async (): Promise<AacEncoderSession> => {
+    if (!sessionRef.current) {
+      sessionRef.current = await createAacEncoderSession(
+        source.sampleRate,
+        Math.min(2, source.channels),
+        bitrate,
+      );
+    }
+    return sessionRef.current;
+  };
+
+  try {
+    for (const segment of segments) {
     if (isCancelled?.()) throw new DOMException('cancelled', 'AbortError');
 
     const name = buildFileName(source.name, segment.index, total, format);
@@ -57,33 +78,43 @@ export async function exportSegments(options: ExportOptions): Promise<ExportFile
 
     let blob: Blob;
 
-    if (canCopyMp3Frames && source.mp3Index) {
-      const bytes = sliceMp3(source.bytes, source.mp3Index, segment.start, segment.end);
-      blob = new Blob([blobPart(bytes)], { type: 'audio/mpeg' });
-    } else {
-      const startSample = Math.round(segment.start * source.sampleRate);
-      const endSample = Math.round(segment.end * source.sampleRate);
-      let channels = sliceChannels(source.buffer, startSample, endSample, 2);
-
-      if (format === 'wav') {
-        blob = encodeWav(channels, source.sampleRate);
-      } else if (format === 'mp3') {
-        const targetRate = nearestMp3SampleRate(source.sampleRate);
-        if (targetRate !== source.sampleRate) {
-          channels = await resampleChannels(channels, source.sampleRate, targetRate);
-        }
-        const data = await encodeMp3(channels, targetRate, bitrate);
-        blob = new Blob([blobPart(data)], { type: 'audio/mpeg' });
-      } else if (aacViaWebCodecs) {
-        blob = await encodeAac(channels, source.sampleRate, bitrate);
+      if (canCopyMp3Frames && source.mp3Index) {
+        const bytes = sliceMp3(source.bytes, source.mp3Index, segment.start, segment.end);
+        blob = new Blob([blobPart(bytes)], { type: 'audio/mpeg' });
+      } else if (canCopyM4aSamples && source.mp4Index) {
+        blob = await copyM4aSegment({
+          bytes: source.bytes,
+          index: source.mp4Index,
+          startSec: segment.start,
+          endSec: segment.end,
+        });
       } else {
-        blob = await encodeAacWithFFmpeg(channels, source.sampleRate, bitrate, onStatus);
-      }
-    }
+        const startSample = Math.round(segment.start * source.sampleRate);
+        const endSample = Math.round(segment.end * source.sampleRate);
+        let channels = sliceChannels(source.buffer, startSample, endSample, 2);
 
-    files.push({ name, blob });
-    onProgress?.(segment.index + 1, total, name);
-    await nextFrame();
+        if (format === 'wav') {
+          blob = encodeWav(channels, source.sampleRate);
+        } else if (format === 'mp3') {
+          const targetRate = nearestMp3SampleRate(source.sampleRate);
+          if (targetRate !== source.sampleRate) {
+            channels = await resampleChannels(channels, source.sampleRate, targetRate);
+          }
+          const data = await encodeMp3(channels, targetRate, bitrate);
+          blob = new Blob([blobPart(data)], { type: 'audio/mpeg' });
+        } else if (aacViaWebCodecs) {
+          blob = await (await getAacSession()).encode(channels);
+        } else {
+          blob = await encodeAacWithFFmpeg(channels, source.sampleRate, bitrate, onStatus);
+        }
+      }
+
+      files.push({ name, blob });
+      onProgress?.(segment.index + 1, total, name);
+      await nextFrame();
+    }
+  } finally {
+    sessionRef.current?.close();
   }
 
   return files;

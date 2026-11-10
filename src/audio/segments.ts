@@ -1,5 +1,3 @@
-import { nextFrame } from './util';
-
 export type Segment = {
   index: number;
   start: number;
@@ -51,39 +49,45 @@ export function equalSplits(duration: number, count: number): number[] {
   return normalizeSplits(splits, duration);
 }
 
-/** 無音区間の中央を分割点として検出する */
+/**
+ * 無音区間の中央を分割点として検出する。
+ * 長い音源でもメインスレッドを塞がないよう、一定時間ごとにフレームを譲る。
+ */
 export async function detectSilenceSplits(
   buffer: AudioBuffer,
   options: SilenceOptions,
   onProgress?: (ratio: number) => void,
 ): Promise<number[]> {
-  const rate = buffer.sampleRate;
-  const hop = Math.max(1, Math.round(rate * 0.01)); // 10ms
-  const frames = Math.floor(buffer.length / hop);
-  if (frames < 2) return [];
-
   const channels: Float32Array[] = [];
   for (let c = 0; c < buffer.numberOfChannels; c++) channels.push(buffer.getChannelData(c));
+  const rate = buffer.sampleRate;
+  const duration = buffer.duration;
+  const hop = Math.max(1, Math.round(rate * 0.01)); // 10ms
+  const length = channels[0]?.length ?? 0;
+  const frames = Math.floor(length / hop);
+  if (frames < 2) return [];
 
   const rms = new Float32Array(frames);
-  const chunk = 2000;
-  for (let start = 0; start < frames; start += chunk) {
-    const stop = Math.min(frames, start + chunk);
-    for (let f = start; f < stop; f++) {
-      const from = f * hop;
-      const to = from + hop;
-      let sum = 0;
-      for (let c = 0; c < channels.length; c++) {
-        const data = channels[c];
-        for (let i = from; i < to; i++) {
-          const v = data[i];
-          sum += v * v;
-        }
+  const BUDGET_MS = 8;
+  let sliceStart = performance.now();
+  for (let f = 0; f < frames; f++) {
+    const from = f * hop;
+    const to = from + hop;
+    let sum = 0;
+    for (let c = 0; c < channels.length; c++) {
+      const data = channels[c];
+      for (let i = from; i < to; i++) {
+        const v = data[i];
+        sum += v * v;
       }
-      rms[f] = Math.sqrt(sum / (hop * channels.length));
     }
-    onProgress?.(stop / frames);
-    await nextFrame();
+    rms[f] = Math.sqrt(sum / (hop * channels.length));
+
+    if (performance.now() - sliceStart >= BUDGET_MS) {
+      onProgress?.((f + 1) / frames);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      sliceStart = performance.now();
+    }
   }
 
   const threshold = Math.pow(10, options.thresholdDb / 20);
@@ -103,7 +107,6 @@ export async function detectSilenceSplits(
   }
 
   const minSegment = Math.max(0.05, options.minSegmentMs / 1000);
-  const duration = buffer.duration;
   const accepted: number[] = [];
   let last = 0;
   for (const point of candidates) {

@@ -10,6 +10,7 @@ import {
   type Segment,
 } from './audio/segments';
 import { indexMp3 } from './audio/mp3frames';
+import { indexMp4 } from './audio/mp4frames';
 import { buildFileName, exportSegments, type ExportFile } from './audio/export';
 import { Waveform } from './ui/waveform';
 import { Player } from './ui/player';
@@ -164,6 +165,7 @@ async function loadFile(file: File): Promise<void> {
       duration: decoded.duration,
       peaks,
       mp3Index: ext === 'mp3' ? indexMp3(bytes) : null,
+      mp4Index: ext === 'm4a' || ext === 'mp4' || ext === 'm4b' || ext === 'aac' ? indexMp4(bytes) : null,
     };
 
     splits = [];
@@ -244,7 +246,9 @@ function updateQualityOptions(): void {
   }
 
   outQuality.disabled = false;
-  const canCopyFrames = format === 'mp3' && source?.ext === 'mp3' && source.mp3Index !== null;
+  const canCopyFrames =
+    (format === 'mp3' && source?.ext === 'mp3' && source.mp3Index !== null) ||
+    (format === 'm4a' && source?.mp4Index != null);
   if (canCopyFrames) outQuality.add(new Option('元のまま (高速)', 'original'));
 
   const rates = format === 'mp3' ? [128, 192, 256, 320] : [128, 192, 256];

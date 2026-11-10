@@ -1,4 +1,5 @@
 import { extOf } from './util';
+import { readBoxes } from './mp4boxes';
 
 export type DecodedAudio = {
   buffer: AudioBuffer;
@@ -30,34 +31,6 @@ function probeMp3Rate(bytes: Uint8Array): number | null {
     return base / 4;
   }
   return null;
-}
-
-type Box = { type: string; contentStart: number; end: number };
-
-function readBoxes(view: DataView, start: number, end: number): Box[] {
-  const boxes: Box[] = [];
-  let pos = start;
-  while (pos + 8 <= end) {
-    let size = view.getUint32(pos);
-    const type = String.fromCharCode(
-      view.getUint8(pos + 4),
-      view.getUint8(pos + 5),
-      view.getUint8(pos + 6),
-      view.getUint8(pos + 7),
-    );
-    let header = 8;
-    if (size === 1) {
-      if (pos + 16 > end) break;
-      size = view.getUint32(pos + 8) * 4294967296 + view.getUint32(pos + 12);
-      header = 16;
-    } else if (size === 0) {
-      size = end - pos;
-    }
-    if (size < header || pos + size > end) break;
-    boxes.push({ type, contentStart: pos + header, end: pos + size });
-    pos += size;
-  }
-  return boxes;
 }
 
 /** MP4/M4A の mdhd からサンプルレートを読む */
